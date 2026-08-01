@@ -141,9 +141,7 @@ def execute_screenshot() -> dict:
 
 def execute_browser(url: str) -> dict:
     subprocess.Popen(
-        ["powershell", "-ExecutionPolicy", "Bypass", "-File",
-                 "C:\\Users\\abdul\\AppData\\Local\\hermes\\bridge\\navigate.ps1",
-                 url],
+        ["cmd", "/c", "start", "", url],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     return {"opened": url}
