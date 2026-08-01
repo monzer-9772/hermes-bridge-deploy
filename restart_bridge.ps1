@@ -1,23 +1,29 @@
-# Hermes Bridge v3.1 Restart Script
-# Pure PowerShell - works without batch parsing issues
-
+# Hermes Bridge v3.1 Restart - With CORRECT Python
 $ErrorActionPreference = "Continue"
 $InstallDir = "C:\Users\abdul\AppData\Local\hermes\bridge"
-$PythonExe = "C:\Users\abdul\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+$PythonExe = "C:\Users\abdul\AppData\Local\hermes\hermes-agent\venv\Scripts\python.exe"
 
 Write-Host "=== Hermes Bridge v3.1 Restart ===" -ForegroundColor Cyan
 Write-Host ""
 
+# Verify Python
 if (-not (Test-Path $PythonExe)) {
     Write-Host "Python not found at $PythonExe" -ForegroundColor Red
-    $PythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if (-not $PythonExe) {
-        Write-Host "No Python in PATH. Aborting." -ForegroundColor Red
-        pause
-        exit 1
-    }
+    pause
+    exit 1
 }
 Write-Host "Python: $PythonExe" -ForegroundColor Green
+
+# Verify deps
+Write-Host ""
+Write-Host "Verifying dependencies..." -ForegroundColor Yellow
+$depCheck = & $PythonExe -c "import httpx, uvicorn, fastapi; print('OK')" 2>&1
+if ($depCheck -ne "OK") {
+    Write-Host "Missing deps: $depCheck" -ForegroundColor Red
+    pause
+    exit 1
+}
+Write-Host "Dependencies OK" -ForegroundColor Green
 
 # Step 1: Kill existing bridges
 Write-Host ""
@@ -86,6 +92,5 @@ try {
 }
 
 Write-Host ""
-Write-Host "Done! Tunnel should auto-connect to: https://genealogy-secondary-rate-aims.trycloudflare.com" -ForegroundColor Cyan
-Write-Host "(If tunnel also died, you'll need to restart it too)"
+Write-Host "Done! Tunnel: https://genealogy-secondary-rate-aims.trycloudflare.com" -ForegroundColor Cyan
 pause
