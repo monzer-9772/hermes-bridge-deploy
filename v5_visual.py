@@ -70,7 +70,7 @@ AUTH_TOKEN = os.environ.get("HERMES_BRIDGE_TOKEN", "hm-bridge-2026-secure-token-
 PORT = int(os.environ.get("PORT", "8765"))  # v3 default; set 7777 if you want to match the task
 DEFAULT_LAPTOP_ID = os.environ.get("HERMES_DEFAULT_LAPTOP", "abdul@abd")
 
-LOG_FILE = os.environ.get("BRIDGE_LOG_FILE", "/workspace/hermes_laptop_bridge/v5_visual.log")
+LOG_FILE = os.environ.get("BRIDGE_LOG_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "v5_visual.log"))
 SCREENCAST_DEFAULT_INTERVAL = float(os.environ.get("SCREENCAST_INTERVAL", "0.4"))  # 2.5 fps
 SCREENCAST_MAX_FRAMES = int(os.environ.get("SCREENCAST_MAX_FRAMES", "0"))  # 0 = unlimited
 SCREENSHOT_DEFAULT_FORMAT = os.environ.get("SCREENSHOT_DEFAULT_FORMAT", "png")  # png|jpeg
@@ -757,7 +757,7 @@ async def tunnel_url_handler(request: web.Request) -> web.Response:
     if railway_domain:
         url = f"https://{railway_domain}"
         return web.json_response({'url': url, 'ws_url': url.replace('https://', 'wss://') + '/ws'})
-    url_file = os.environ.get("TUNNEL_URL_FILE", "/workspace/hermes_laptop_bridge/tunnel_url.txt")
+    url_file = os.environ.get("TUNNEL_URL_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnel_url.txt"))
     if os.path.exists(url_file):
         with open(url_file) as f:
             url = f.read().strip()
