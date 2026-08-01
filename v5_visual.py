@@ -264,18 +264,41 @@ async def start_browser_handler(request: web.Request) -> web.Response:
     (which is defined in browser_actions.py and already starts Chrome with
     the debug flag if it isn't running). This is the v5 Visual Edition's
     idempotent entry point.
+
+    SELF-HOSTED MODE: when v5_visual is running ON the laptop (not on a separate
+    server), the laptop is the machine. In that case we skip the WebSocket
+    round-trip and call browser_open / launch Chrome directly.
     """
     laptop_id = request.query.get('laptop_id', DEFAULT_LAPTOP_ID)
-    if laptop_id not in connected_laptops:
-        return web.json_response(
-            {'success': False, 'error': f'Laptop {laptop_id} not connected'},
-            status=503,
-        )
     try:
         body = await request.json() if request.body_exists else {}
     except Exception:
         body = {}
     url = body.get('url') or 'about:blank'
+
+    # Self-hosted mode: execute locally
+    if laptop_id not in connected_laptops and _is_self_hosted():
+        result = await _local_browser_open(url)
+        browser_state[laptop_id] = {
+            'started_at': datetime.now().isoformat(),
+            'url': url,
+            'result': result,
+            'self_hosted': True,
+        }
+        return web.json_response({
+            'success': result.get('success', False),
+            'laptop_id': laptop_id,
+            'debugger_url_http': 'http://127.0.0.1:9222',
+            'debugger_url_ws_root': 'ws://127.0.0.1:9222',
+            'self_hosted': True,
+            'browser_open_result': result,
+        })
+
+    if laptop_id not in connected_laptops:
+        return web.json_response(
+            {'success': False, 'error': f'Laptop {laptop_id} not connected'},
+            status=503,
+        )
 
     # browser_open(url) starts Chrome if needed and navigates.
     result = await call_browser(laptop_id, 'browser_open', {'url': url}, timeout=30)
@@ -306,6 +329,28 @@ async def start_browser_handler(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 async def browser_status_handler(request: web.Request) -> web.Response:
     laptop_id = request.query.get('laptop_id', DEFAULT_LAPTOP_ID)
+
+    # Self-hosted mode: query local Chrome directly
+    if laptop_id not in connected_laptops and _is_self_hosted():
+        tabs_result = await _local_list_tabs()
+        chrome_running = tabs_result.get('success', False)
+        active = None
+        if chrome_running and tabs_result.get('tabs'):
+            active = tabs_result['tabs'][0]
+        return web.json_response({
+            'success': True,
+            'laptop_id': laptop_id,
+            'laptop_connected': True,
+            'self_hosted': True,
+            'chrome_running_on_laptop': chrome_running,
+            'debugger_url_http': 'http://127.0.0.1:9222',
+            'debugger_url_ws_root': 'ws://127.0.0.1:9222',
+            'tabs': tabs_result,
+            'active_url': active.get('url') if active else None,
+            'active_title': active.get('title') if active else None,
+            'cached_state': browser_state.get(laptop_id),
+        })
+
     if laptop_id not in connected_laptops:
         return web.json_response(
             {'success': False, 'connected': False,
@@ -343,6 +388,20 @@ async def screenshot_handler(request: web.Request) -> web.Response:
     if fmt not in ('png', 'jpeg', 'jpg'):
         fmt = 'png'
     quality = int(request.query.get('q', '70'))
+
+    # Self-hosted mode: capture locally via CDP
+    if laptop_id not in connected_laptops and _is_self_hosted():
+        r = await _local_screenshot_browser(fmt=fmt if fmt in ('png', 'jpeg') else 'png')
+        if not r.get('success'):
+            return web.json_response(r, status=500)
+        return web.json_response({
+            'success': True,
+            'laptop_id': laptop_id,
+            'self_hosted': True,
+            'format': r.get('format', fmt),
+            'image_base64': r.get('data'),
+            'ts': datetime.now().isoformat(),
+        })
 
     if laptop_id not in connected_laptops:
         return web.json_response(
@@ -404,11 +463,6 @@ async def screenshot_handler(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 async def cdp_handler(request: web.Request) -> web.Response:
     laptop_id = request.query.get('laptop_id', DEFAULT_LAPTOP_ID)
-    if laptop_id not in connected_laptops:
-        return web.json_response(
-            {'success': False, 'error': f'Laptop {laptop_id} not connected'},
-            status=503,
-        )
     try:
         body = await request.json()
     except Exception:
@@ -423,6 +477,13 @@ async def cdp_handler(request: web.Request) -> web.Response:
             {'success': False, 'error': "missing 'method' (e.g. 'Page.navigate', 'Runtime.evaluate')"},
             status=400,
         )
+
+    # Self-hosted mode: send CDP locally
+    if laptop_id not in connected_laptops and _is_self_hosted():
+        r = await _local_cdp(method, params, tab_id)
+        return web.json_response({**r, 'self_hosted': True})
+
+    if laptop_id not in connected_laptops:
 
     result = await send_command(
         laptop_id, None, 30,
@@ -967,6 +1028,114 @@ def _local_shell(args):
         return {"success": True, "stdout": r.stdout, "stderr": r.stderr, "code": r.returncode}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Self-hosted mode: v5_visual runs ON the laptop, executes commands locally
+# ---------------------------------------------------------------------------
+import platform as _platform
+
+def _is_self_hosted() -> bool:
+    """Return True if v5_visual is running on the laptop (Windows/macOS)."""
+    return _platform.system() in ("Windows", "Darwin")
+
+
+async def _local_browser_open(url: str) -> dict:
+    """Open Chrome locally with --remote-debugging-port=9222."""
+    import subprocess
+    import os as _os
+    # Find Chrome
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        _os.path.join(_os.environ.get("LOCALAPPDATA", ""), r"Google\Chrome\Application\chrome.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    chrome = next((c for c in candidates if _os.path.exists(c)), None)
+    if not chrome:
+        return {"success": False, "error": "Chrome not found in standard locations"}
+
+    # Kill any existing Chrome with remote-debugging
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "chrome.exe", "/FI", "WINDOWTITLE eq Chrome*"],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        pass
+    await asyncio.sleep(1)
+
+    # Start Chrome
+    args = [
+        chrome,
+        "--remote-debugging-port=9222",
+        "--remote-allow-origins=*",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url,
+    ]
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Wait for Chrome to come up
+        import urllib.request
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=1) as r:
+                    tabs = json.loads(r.read())
+                    return {"success": True, "pid": proc.pid, "tabs": len(tabs), "url": url}
+            except Exception:
+                continue
+        return {"success": False, "error": "Chrome started but debug port not responding"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def _local_cdp(method: str, params: dict, tab_id: str = None) -> dict:
+    """Send a raw CDP command to the local Chrome instance."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=5) as r:
+            tabs = json.loads(r.read())
+        if not tabs:
+            return {"success": False, "error": "no Chrome tabs"}
+        tab = next((t for t in tabs if t.get("id") == tab_id), tabs[0])
+        ws_url = tab["webSocketDebuggerUrl"]
+
+        try:
+            import websocket  # python-websocket-client
+        except ImportError:
+            return {"success": False, "error": "websocket-client not installed"}
+
+        ws = websocket.create_connection(ws_url, timeout=10)
+        try:
+            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+            while True:
+                msg = json.loads(ws.recv())
+                if msg.get("id") == 1:
+                    return {
+                        "success": True,
+                        "result": msg.get("result"),
+                        "error": msg.get("error"),
+                    }
+        finally:
+            ws.close()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def _local_screenshot_browser(tab_id: str = None, fmt: str = "png") -> dict:
+    """Take a screenshot of the current Chrome tab via CDP."""
+    import base64
+    r = await _local_cdp("Page.captureScreenshot", {"format": fmt}, tab_id)
+    if not r.get("success"):
+        return r
+    data = r.get("result", {}).get("data", "")
+    return {"success": True, "format": fmt, "data": data}
 
 
 if __name__ == '__main__':
