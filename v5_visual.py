@@ -484,6 +484,10 @@ async def cdp_handler(request: web.Request) -> web.Response:
         return web.json_response({**r, 'self_hosted': True})
 
     if laptop_id not in connected_laptops:
+        return web.json_response(
+            {'success': False, 'error': f'Laptop {laptop_id} not connected'},
+            status=503,
+        )
 
     result = await send_command(
         laptop_id, None, 30,
