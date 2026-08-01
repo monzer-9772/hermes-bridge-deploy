@@ -834,10 +834,168 @@ Until this is deployed, /cdp will return HTTP 501 with a clear hint.
 """
 
 
+# ---------------------------------------------------------------------------
+# Optional: Self-register as a laptop with an upstream Hermes server
+# ---------------------------------------------------------------------------
+async def self_register_loop(upstream_ws: str, laptop_id: str):
+    """
+    Connect to the upstream server (server.py) as a laptop WebSocket client.
+    Receives command frames, dispatches them locally via _dispatch_local_action,
+    and sends back results. This lets v5_visual act as both a server and a laptop.
+    """
+    import websockets  # local import; not needed for server-only mode
+
+    backoff = 1
+    while True:
+        try:
+            logger.info(f"🔗 Registering with upstream: {upstream_ws} as {laptop_id}")
+            async with websockets.connect(
+                upstream_ws,
+                extra_headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+                ping_interval=20,
+                ping_timeout=20,
+            ) as ws:
+                # Send register frame (server.py expects this format)
+                register = {
+                    "type": "register",
+                    "laptop_id": laptop_id,
+                    "version": "v5_visual",
+                    "capabilities": ["screenshot", "browser", "cdp", "system"],
+                }
+                await ws.send(json.dumps(register))
+                ack = json.loads(await ws.recv())
+                logger.info(f"📝 Register ack: {ack}")
+                backoff = 1
+
+                async for msg in ws:
+                    try:
+                        frame = json.loads(msg)
+                    except Exception:
+                        continue
+                    await _handle_upstream_frame(ws, frame, laptop_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"⚠️  Upstream connection lost: {e}; retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+async def _handle_upstream_frame(ws, frame, laptop_id):
+    """Handle a single command frame from the upstream server."""
+    if frame.get("type") != "command":
+        return
+    cmd_id = frame.get("id")
+    action = frame.get("action", "")
+    args = frame.get("args", {}) or {}
+    logger.info(f"📥 Upstream command: {action} (id={cmd_id})")
+    try:
+        result = await _dispatch_local_action(action, args)
+        await ws.send(json.dumps({
+            "type": "result",
+            "id": cmd_id,
+            "laptop_id": laptop_id,
+            "success": True,
+            "result": result,
+        }))
+    except Exception as e:
+        logger.exception(f"❌ Command {action} failed: {e}")
+        await ws.send(json.dumps({
+            "type": "result",
+            "id": cmd_id,
+            "laptop_id": laptop_id,
+            "success": False,
+            "error": str(e),
+        }))
+
+
+async def _dispatch_local_action(action: str, args: dict):
+    """
+    Dispatch a command locally on this laptop using browser_actions / shell_actions.
+    This is a thin shim around the laptop-side capabilities. For the v5_visual
+    use case, the most common actions are: screenshot, browser.*, shell.*, etc.
+    """
+    # Dynamic import of laptop modules
+    import importlib
+    try:
+        ba = importlib.import_module("browser_actions")
+    except ImportError:
+        ba = None
+    try:
+        sa = importlib.import_module("shell_actions")
+    except ImportError:
+        sa = None
+
+    if action == "screenshot":
+        return _local_screenshot(args)
+    if action == "shell":
+        if sa and hasattr(sa, "shell_run"):
+            return await sa.shell_run(args.get("command", ""))
+        return _local_shell(args)
+    if action.startswith("browser_"):
+        if ba and hasattr(ba, "BROWSER_ACTIONS"):
+            fn = ba.BROWSER_ACTIONS.get(action)
+            if fn:
+                return fn(args)
+        return {"success": False, "error": f"browser action {action} not available"}
+    return {"success": False, "error": f"unknown action: {action}"}
+
+
+def _local_screenshot(args):
+    """Take a screenshot using mss or PIL.ImageGrab."""
+    try:
+        import mss
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]  # primary
+            img = sct.grab(monitor)
+            from PIL import Image
+            import io, base64
+            pil = Image.frombytes("RGB", img.size, img.rgb, "raw", "RGB")
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            return {"success": True, "format": "png", "data": b64}
+    except Exception as e:
+        return {"success": False, "error": f"screenshot failed: {e}"}
+
+
+def _local_shell(args):
+    import subprocess
+    cmd = args.get("command", "")
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        return {"success": True, "stdout": r.stdout, "stderr": r.stderr, "code": r.returncode}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 if __name__ == '__main__':
     logger.info(f"🚀 Hermes Bridge v5 Visual on 0.0.0.0:{PORT}")
     logger.info(f"🔑 Auth token: {AUTH_TOKEN[:15]}...")
     logger.info(f"💻 Default laptop: {DEFAULT_LAPTOP_ID}")
     print(LAPTOP_PATCH_INSTRUCTIONS)
+
+    # Optional: Self-register as a laptop with the upstream server (server.py).
+    # This makes v5_visual reachable from the existing control plane without
+    # needing a separate bridge_agent to be running.
     app = make_app()
+
+    async def _on_startup(app):
+        upstream = os.environ.get("HERMES_UPSTREAM_WS", "").strip()
+        laptop_id = os.environ.get("HERMES_LAPTOP_ID", DEFAULT_LAPTOP_ID).strip()
+        if not upstream:
+            logger.info("ℹ️  No HERMES_UPSTREAM_WS set - skipping self-registration")
+            return
+        logger.info(f"🔗 Self-registering laptop '{laptop_id}' with upstream {upstream}")
+        # Run registration in background; retries forever
+        app['register_task'] = asyncio.create_task(self_register_loop(upstream, laptop_id))
+
+    async def _on_cleanup(app):
+        task = app.get('register_task')
+        if task:
+            task.cancel()
+
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+
     web.run_app(app, host='0.0.0.0', port=PORT, print=lambda *a, **k: None)
