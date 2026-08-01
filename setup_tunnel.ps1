@@ -1,40 +1,74 @@
-# Setup cloudflared tunnel
-$ErrorActionPreference = "Stop"
-$dir = "C:\Users\mmh\hermes_sync"
-$cfPath = "$dir\cloudflared.exe"
-$cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+$installDir = "C:\Users\abdul\AppData\Local\hermes\bridge"
+$tunnelDir = "$installDir\tunnel"
 
-Write-Host "=== Cloudflared Setup ==="
+New-Item -ItemType Directory -Path $tunnelDir -Force | Out-Null
 
-# Download
-if (-not (Test-Path $cfPath)) {
-    Write-Host "Downloading cloudflared..."
-    Invoke-WebRequest -Uri $cfUrl -OutFile $cfPath -UseBasicParsing
-    Write-Host "  Size: $((Get-Item $cfPath).Length) bytes"
+# Check if cloudflared exists
+$cf = Get-Command "cloudflared" -EA SilentlyContinue
+if (-not $cf) {
+    Write-Host "=== Downloading cloudflared ==="
+    $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+    $dest = "$tunnelDir\cloudflared.exe"
+    Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+    Write-Host "  Saved: $dest"
 } else {
-    Write-Host "Already exists: $cfPath"
+    Write-Host "cloudflared already installed: $($cf.Source)"
 }
 
-# Verify it runs
-$ver = & $cfPath --version 2>&1
-Write-Host "  Version: $ver"
-
-# Start tunnel pointing to bridge_agent's connection
-# (Note: bridge_agent is WS client, NOT server. cloudflared needs a local HTTP server)
-# We need to either:
-# 1. Run a local HTTP server that wraps bridge_agent's WS
-# 2. Use cloudflared with --hostname for persistent URL
-
+# Start tunnel in background pointing to our bridge
 Write-Host ""
-Write-Host "NOTE: bridge_agent.py is a WebSocket CLIENT."
-Write-Host "cloudflared needs an HTTP server to tunnel."
-Write-Host ""
-Write-Host "Options:"
-Write-Host "  A) Start v5_visual.py (HTTP server) on 8765, then tunnel to it"
-Write-Host "  B) Use cloudflared with --url to set up quick tunnel"
-Write-Host ""
+Write-Host "=== Starting cloudflared tunnel ==="
+$logFile = "$tunnelDir\tunnel.log"
+$errFile = "$tunnelDir\tunnel.err"
+Remove-Item $logFile, $errFile -EA SilentlyContinue
 
-# Test that the bridge_agent WS connection works
-# (the WS URL is hardcoded in bridge_agent.py)
-Write-Host "Bridge agent's WS target: wss://sponsor-brad-satisfy-females.trycloudflare.com/ws"
-Write-Host "(if this URL is dead, bridge_agent can't connect)"
+$cfPath = "$tunnelDir\cloudflared.exe"
+if (-not (Test-Path $cfPath)) { $cfPath = "cloudflared" }
+
+$proc = Start-Process -FilePath $cfPath -ArgumentList "tunnel","--url","http://127.0.0.1:8765","--no-autoupdate" -WorkingDirectory $tunnelDir -WindowStyle Hidden -RedirectStandardOutput $logFile -RedirectStandardError $errFile -PassThru
+Write-Host "  Tunnel PID: $($proc.Id)"
+
+# Wait for URL to appear in log
+$tunnelUrl = $null
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Seconds 2
+    if (Test-Path $errFile) {
+        $content = Get-Content $errFile -Raw -EA SilentlyContinue
+        if ($content -match 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com') {
+            $tunnelUrl = $matches[0]
+            break
+        }
+    }
+    Write-Host "  ...waiting ($($i+1)/30)"
+}
+
+if ($tunnelUrl) {
+    Write-Host ""
+    Write-Host "✅ TUNNEL URL: $tunnelUrl"
+    # Save for later
+    Set-Content -Path "$tunnelDir\url.txt" -Value $tunnelUrl
+} else {
+    Write-Host ""
+    Write-Host "❌ Tunnel URL not found in 60s"
+    if (Test-Path $errFile) { Get-Content $errFile -Tail 30 }
+}
+
+# Test it
+if ($tunnelUrl) {
+    Write-Host ""
+    Write-Host "=== Test tunnel ==="
+    try {
+        $r = Invoke-RestMethod -Uri "$tunnelUrl/ping" -Method Get
+        Write-Host "✅ Public /ping: pong=$($r.pong)"
+    } catch {
+        Write-Host "❌ /ping via tunnel: $_"
+    }
+    try {
+        $headers = @{ Authorization = "Bearer hm-bridge-2026-secure-token-v3" }
+        $body = @{ command = "echo tunnel is alive" } | ConvertTo-Json
+        $r = Invoke-RestMethod -Uri "$tunnelUrl/shell" -Method Post -Headers $headers -ContentType "application/json" -Body $body
+        Write-Host "✅ Public /shell: '$($r.stdout.Trim())'"
+    } catch {
+        Write-Host "❌ /shell via tunnel: $_"
+    }
+}
